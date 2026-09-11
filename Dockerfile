@@ -7,9 +7,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config.py oidc.py relay.py entrypoint.sh ./
-RUN chmod +x entrypoint.sh
+COPY config.py oidc.py relay.py ./
 
 RUN useradd -r -s /sbin/nologin relay
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["python3", "relay.py"]
