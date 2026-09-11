@@ -1,0 +1,30 @@
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./certs:/app/certs:ro
+      - relay-data:/app/data
+    environment:
+      DISCORD_TOKEN: ""
+      OIDC_ISSUER: "https://account.ceagle.cc"
+      OIDC_CLIENT_ID: ""
+      OIDC_CLIENT_SECRET: ""
+      OIDC_TOKEN_ENDPOINT_AUTH_METHOD: "none"
+      RELAY_HOST: "0.0.0.0"
+      RELAY_PORT: "8443"
+      RELAY_CERT: "/app/certs/relay_cert.pem"
+      RELAY_KEY: "/app/certs/relay_key.pem"
+      DATABASE_FILE: "/app/data/relay.sqlite3"
+      DISCORD_DISPLAY_FMT: "[{user}] {text}"
+      SESSION_TTL: "3600"
+      LOGIN_TIMEOUT: "600"
+      MAX_CLIENTS: "64"
+      MAX_CLIENTS_PER_IP: "4"
+      MAX_SESSIONS: "1024"
+      SEND_INTERVAL: "2"
+
+volumes:
+  relay-data:
