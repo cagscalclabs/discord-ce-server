@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8443:8443"
+      - "9443:8443"
     volumes:
       - ./certs:/app/certs:ro
       - relay-data:/app/data
