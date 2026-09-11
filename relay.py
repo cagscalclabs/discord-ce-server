@@ -650,6 +650,7 @@ async def main():
     validate_runtime(config)
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.minimum_version = ssl.TLSVersion.TLSv1_3
+    tls.set_ciphers("TLS_AES_128_GCM_SHA256")
     tls.load_cert_chain(config["RELAY_CERT"], config["RELAY_KEY"])
     store = LinkStore(config["DATABASE_FILE"])
     try:
