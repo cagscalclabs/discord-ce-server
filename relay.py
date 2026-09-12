@@ -264,7 +264,7 @@ class RelayServer:
         except RelayError as exc:
             await client.emit("error", id=request_id, code=str(exc))
         except Exception:
-            log.error("Device login failed")
+            log.exception("Device login failed")
             await client.emit("error", id=request_id, code="login_failed")
 
     async def authenticate(self, client, identity, user_id, request_id):

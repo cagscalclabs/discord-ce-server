@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+import logging
 import time
 from urllib.parse import quote_plus
 
@@ -16,6 +17,7 @@ from config import https_url
 
 
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+log = logging.getLogger("relay")
 
 
 class AuthError(Exception):
@@ -83,6 +85,9 @@ class OIDCProvider:
     async def start(self):
         status, data = await self.post("device_authorization_endpoint", {"scope": "openid"})
         if status != 200:
+            error = data.get("error")
+            log.warning("Device authorization rejected: HTTP %d (%s)", status,
+                        error if isinstance(error, str) and error.isascii() else "no error code")
             raise AuthError("device_authorization_failed")
         for key in ("device_code", "user_code", "verification_uri"):
             if not isinstance(data.get(key), str) or not 1 <= len(data[key]) <= 1024:
