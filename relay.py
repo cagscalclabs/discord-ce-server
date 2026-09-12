@@ -660,7 +660,7 @@ async def main():
             async with DiscordBridge(relay) as bridge:
                 server = await asyncio.start_server(relay.handle_client, config["RELAY_HOST"],
                                                     config["RELAY_PORT"], ssl=tls, limit=MAX_LINE,
-                                                    ssl_handshake_timeout=10)
+                                                    ssl_handshake_timeout=30)
                 log.info("Relay listening on %s:%d (TLS 1.3, protocol 2)",
                          config["RELAY_HOST"], config["RELAY_PORT"])
                 try:
