@@ -13,6 +13,8 @@ services:
       OIDC_CLIENT_ID: ""
       OIDC_CLIENT_SECRET: ""
       OIDC_TOKEN_ENDPOINT_AUTH_METHOD: "none"
+      OIDC_ALLOW_REFRESH: "false"
+      RELAY_TOKEN_KEY: ""  # Required when OIDC_ALLOW_REFRESH=true. Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
       RELAY_HOST: "0.0.0.0"
       RELAY_PORT: "8443"
       RELAY_CERT: "/app/certs/relay_cert.pem"

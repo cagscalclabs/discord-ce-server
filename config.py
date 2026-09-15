@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 DEFAULTS = {
     "DISCORD_TOKEN": "",
+    "RELAY_TOKEN_KEY": "",
     "PERMISSIONS": 68608,  # View Channels, Send Messages, Read Message History.
     "RELAY_HOST": "0.0.0.0",
     "RELAY_PORT": 8443,
@@ -24,9 +25,10 @@ DEFAULTS = {
     "SEND_INTERVAL": 2,
 }
 
-OIDC_FIELDS = {"issuer", "client_id", "client_secret", "token_endpoint_auth_method"}
+OIDC_FIELDS = {"issuer", "client_id", "client_secret", "token_endpoint_auth_method", "allow_refresh"}
 OIDC_DEFAULTS = {"issuer": "https://account.ceagle.cc", "client_id": "",
-                 "client_secret": "", "token_endpoint_auth_method": "none"}
+                 "client_secret": "", "token_endpoint_auth_method": "none",
+                 "allow_refresh": "false"}
 INTEGER_RANGES = {"RELAY_PORT": (1, 65535), "SESSION_TTL": (60, 86400),
                   "LOGIN_TIMEOUT": (60, 1800), "MAX_CLIENTS": (1, 10000),
                   "MAX_CLIENTS_PER_IP": (1, 100), "SEND_INTERVAL": (1, 60)}
@@ -81,6 +83,9 @@ def load_config(path=None, environ=None):
         raise ConfigError("oidc.issuer must be an HTTPS issuer URL without query or fragment.")
     if oidc["token_endpoint_auth_method"] not in {"none", "client_secret_basic", "client_secret_post"}:
         raise ConfigError("Unsupported OIDC token endpoint authentication method.")
+    if oidc["allow_refresh"].lower() not in {"true", "false"}:
+        raise ConfigError("oidc.allow_refresh must be 'true' or 'false'.")
+    oidc["allow_refresh"] = oidc["allow_refresh"].lower() == "true"
 
     result = {}
     for key, default in DEFAULTS.items():
@@ -97,7 +102,7 @@ def load_config(path=None, environ=None):
                 raise ConfigError(f"{key} is outside its allowed range.")
         elif not isinstance(value, str):
             raise ConfigError(f"{key} must be a string.")
-        elif not value.strip() and key != "DISCORD_TOKEN":
+        elif not value.strip() and key not in ("DISCORD_TOKEN", "RELAY_TOKEN_KEY"):
             raise ConfigError(f"{key} must not be empty.")
         result[key] = value
 
@@ -131,3 +136,5 @@ def validate_runtime(config):
     oidc = config["oidc"]
     if oidc["token_endpoint_auth_method"] != "none" and not oidc["client_secret"]:
         raise ConfigError("The selected OIDC authentication method requires a client secret.")
+    if oidc["allow_refresh"] and not config.get("RELAY_TOKEN_KEY", "").strip():
+        raise ConfigError("RELAY_TOKEN_KEY is required when oidc.allow_refresh is enabled.")

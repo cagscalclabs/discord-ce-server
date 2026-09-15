@@ -29,6 +29,7 @@ class Identity:
     issuer: str
     subject: str
     expires_at: float
+    refresh_token: str | None = None
 
 
 class OIDCProvider:
@@ -83,7 +84,8 @@ class OIDCProvider:
         return await self.request("POST", self.metadata[endpoint], data=data, **kwargs)
 
     async def start(self):
-        status, data = await self.post("device_authorization_endpoint", {"scope": "openid"})
+        scope = "openid offline_access" if self.config.get("allow_refresh") else "openid"
+        status, data = await self.post("device_authorization_endpoint", {"scope": scope})
         if status != 200:
             error = data.get("error")
             log.warning("Device authorization rejected: HTTP %d (%s)", status,
@@ -166,6 +168,21 @@ class OIDCProvider:
                 expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
                 if not hmac.compare_digest(expected, claims["at_hash"]):
                     raise ValueError
-            return Identity(claims["iss"], claims["sub"], float(claims["exp"]))
+            refresh_token = None
+            if self.config.get("allow_refresh"):
+                rt = tokens.get("refresh_token")
+                if isinstance(rt, str) and 1 <= len(rt) <= 4096:
+                    refresh_token = rt
+            return Identity(claims["iss"], claims["sub"], float(claims["exp"]), refresh_token)
         except (KeyError, TypeError, ValueError, OverflowError, jwt.PyJWTError):
             raise AuthError("invalid_identity_token") from None
+
+    async def refresh(self, refresh_token):
+        """Exchange a refresh token for a new Identity. Returns Identity with updated expiry."""
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise AuthError("invalid_refresh_token")
+        status, data = await self.post("token_endpoint", {
+            "grant_type": "refresh_token", "refresh_token": refresh_token})
+        if status != 200 or "error" in data:
+            raise AuthError("refresh_failed")
+        return await self.validate(data)

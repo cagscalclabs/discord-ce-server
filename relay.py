@@ -17,6 +17,7 @@ import time
 import aiohttp
 import discord
 from discord import app_commands
+from cryptography.fernet import Fernet, InvalidToken
 
 from config import ConfigError, load_config, validate_runtime
 from oidc import AuthError, Identity, OIDCProvider
@@ -60,7 +61,8 @@ def parse_request(raw):
 class LinkStore:
     """Only verified issuer/subject -> Discord ID links are persisted."""
 
-    def __init__(self, path):
+    def __init__(self, path, fernet=None):
+        self.fernet = fernet
         # Restrict the database before SQLite writes any identity data.
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
@@ -68,6 +70,9 @@ class LinkStore:
         self.db = sqlite3.connect(path)
         self.db.execute("CREATE TABLE IF NOT EXISTS links (issuer TEXT NOT NULL, "
                         "subject TEXT NOT NULL, discord_id TEXT NOT NULL UNIQUE, "
+                        "PRIMARY KEY (issuer, subject))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS refresh_tokens (issuer TEXT NOT NULL, "
+                        "subject TEXT NOT NULL, token TEXT NOT NULL, "
                         "PRIMARY KEY (issuer, subject))")
         self.db.commit()
 
@@ -87,6 +92,29 @@ class LinkStore:
     def remove(self, user_id):
         with self.db:
             self.db.execute("DELETE FROM links WHERE discord_id=?", (str(user_id),))
+            self.db.execute("DELETE FROM refresh_tokens WHERE issuer=(SELECT issuer FROM links WHERE discord_id=?) "
+                            "AND subject=(SELECT subject FROM links WHERE discord_id=?)",
+                            (str(user_id), str(user_id)))
+
+    def get_refresh_token(self, identity):
+        if not self.fernet:
+            return None
+        row = self.db.execute("SELECT token FROM refresh_tokens WHERE issuer=? AND subject=?",
+                              (identity.issuer, identity.subject)).fetchone()
+        if not row:
+            return None
+        try:
+            return self.fernet.decrypt(row[0].encode()).decode()
+        except InvalidToken:
+            return None
+
+    def set_refresh_token(self, identity, token):
+        if not self.fernet:
+            return
+        encrypted = self.fernet.encrypt(token.encode()).decode()
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO refresh_tokens VALUES (?, ?, ?)",
+                            (identity.issuer, identity.subject, encrypted))
 
     def close(self):
         self.db.close()
@@ -286,6 +314,8 @@ class RelayServer:
         client.link_candidate = None
         client.guild_id = client.channel_id = None
         self.active[user_id] = client
+        if identity.refresh_token:
+            self.store.set_refresh_token(identity, identity.refresh_token)
         await client.emit("authenticated", id=request_id, token=token,
                           discord_id=str(user_id), expires_at=int(expires))
 
@@ -317,7 +347,19 @@ class RelayServer:
             self.expire_sessions()
             session = self.sessions.pop(hashlib.sha256(token.encode()).digest(), None)
             if not session or self.store.lookup(session.identity) != session.user_id:
-                raise RelayError("invalid_session")
+                # No live session — attempt silent refresh if a token is stored.
+                rt = self.store.get_refresh_token(
+                    session.identity) if session else None
+                if not rt:
+                    raise RelayError("invalid_session")
+                try:
+                    identity = await self.provider.refresh(rt)
+                except AuthError:
+                    raise RelayError("invalid_session")
+                if self.store.lookup(identity) != session.user_id:
+                    raise RelayError("invalid_session")
+                await self.authenticate(client, identity, session.user_id, request_id)
+                return
             # Resume never extends the original session lifetime.
             identity = Identity(session.identity.issuer, session.identity.subject, session.expires_at)
             await self.authenticate(client, identity, session.user_id, request_id)
@@ -651,7 +693,8 @@ async def main():
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.minimum_version = ssl.TLSVersion.TLSv1_3
     tls.load_cert_chain(config["RELAY_CERT"], config["RELAY_KEY"])
-    store = LinkStore(config["DATABASE_FILE"])
+    fernet = Fernet(config["RELAY_TOKEN_KEY"]) if config.get("RELAY_TOKEN_KEY", "").strip() else None
+    store = LinkStore(config["DATABASE_FILE"], fernet)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
             provider = OIDCProvider(config["oidc"], http)
