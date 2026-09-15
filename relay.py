@@ -348,20 +348,24 @@ class RelayServer:
                 raise RelayError("invalid_session")
             self.expire_sessions()
             session = self.sessions.pop(hashlib.sha256(token.encode()).digest(), None)
+            log.info("RESUME: session_found=%s sessions_total=%d", session is not None, len(self.sessions))
             if not session or self.store.lookup(session.identity) != session.user_id:
+                log.info("RESUME: invalid — session=%s", "missing" if not session else "link_mismatch")
                 raise RelayError("invalid_session")
             if session.expires_at > time.time():
-                # Live session — resume without extending lifetime.
+                log.info("RESUME: live session, resuming")
                 identity = Identity(session.identity.issuer, session.identity.subject, session.expires_at)
                 await self.authenticate(client, identity, session.user_id, request_id)
                 return
-            # Session expired — attempt silent refresh.
+            log.info("RESUME: expired, attempting refresh")
             rt = self.store.get_refresh_token(session.identity)
             if not rt:
+                log.info("RESUME: no refresh token in db")
                 raise RelayError("invalid_session")
             try:
                 identity = await self.provider.refresh(rt)
-            except AuthError:
+            except AuthError as e:
+                log.info("RESUME: refresh failed: %s", e)
                 raise RelayError("invalid_session")
             if self.store.lookup(identity) != session.user_id:
                 raise RelayError("invalid_session")
