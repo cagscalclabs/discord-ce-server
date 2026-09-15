@@ -184,9 +184,10 @@ class RelayServer:
         self.bridge = None
 
     def expire_sessions(self):
-        now = time.time()
+        # Only purge sessions too old to refresh (grace period covers the provider's refresh token lifetime).
+        cutoff = time.time() - 30 * 86400
         self.sessions = {key: value for key, value in self.sessions.items()
-                         if value.expires_at > now}
+                         if value.expires_at > cutoff}
 
     def revoke(self, user_id):
         self.sessions = {key: value for key, value in self.sessions.items()
@@ -300,9 +301,10 @@ class RelayServer:
         if expires <= time.time():
             raise RelayError("session_expired")
         # Rotating credentials also invalidates every previous connection/session.
-        self.expire_sessions()
-        if (len(self.sessions) >= self.config["MAX_SESSIONS"] and
-                not any(session.user_id == user_id for session in self.sessions.values())):
+        now = time.time()
+        live_sessions = sum(1 for s in self.sessions.values() if s.expires_at > now)
+        if (live_sessions >= self.config["MAX_SESSIONS"] and
+                not any(s.user_id == user_id for s in self.sessions.values() if s.expires_at > now)):
             raise RelayError("server_busy")
         self.revoke(user_id)
         token = secrets.token_urlsafe(32)
@@ -347,21 +349,22 @@ class RelayServer:
             self.expire_sessions()
             session = self.sessions.pop(hashlib.sha256(token.encode()).digest(), None)
             if not session or self.store.lookup(session.identity) != session.user_id:
-                # No live session — attempt silent refresh if a token is stored.
-                rt = self.store.get_refresh_token(
-                    session.identity) if session else None
-                if not rt:
-                    raise RelayError("invalid_session")
-                try:
-                    identity = await self.provider.refresh(rt)
-                except AuthError:
-                    raise RelayError("invalid_session")
-                if self.store.lookup(identity) != session.user_id:
-                    raise RelayError("invalid_session")
+                raise RelayError("invalid_session")
+            if session.expires_at > time.time():
+                # Live session — resume without extending lifetime.
+                identity = Identity(session.identity.issuer, session.identity.subject, session.expires_at)
                 await self.authenticate(client, identity, session.user_id, request_id)
                 return
-            # Resume never extends the original session lifetime.
-            identity = Identity(session.identity.issuer, session.identity.subject, session.expires_at)
+            # Session expired — attempt silent refresh.
+            rt = self.store.get_refresh_token(session.identity)
+            if not rt:
+                raise RelayError("invalid_session")
+            try:
+                identity = await self.provider.refresh(rt)
+            except AuthError:
+                raise RelayError("invalid_session")
+            if self.store.lookup(identity) != session.user_id:
+                raise RelayError("invalid_session")
             await self.authenticate(client, identity, session.user_id, request_id)
             return
         if op == "link_confirm":
