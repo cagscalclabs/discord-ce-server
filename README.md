@@ -86,66 +86,6 @@ The relay won't serve Discord data before the bot's cache is ready.
 | `oidc.token_endpoint_auth_method` | `none`, `client_secret_basic`, or `client_secret_post`, matching the registration. |
 | `oidc.allow_refresh` | `true` or `false` (default `false`). When true, requests `offline_access` and keeps encrypted refresh tokens so expired sessions renew silently. Requires `RELAY_TOKEN_KEY` and a registration permitting `offline_access`. |
 
-Environment variables override JSON, which overrides defaults. Top-level fields
-use matching environment names; OIDC overrides are `OIDC_ISSUER`,
-`OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_TOKEN_ENDPOINT_AUTH_METHOD`, and
-`OIDC_ALLOW_REFRESH`.
-The default file is `config.json` beside `relay.py`, independent of launch directory.
-Select a different host config with:
-
-```sh
-RELAY_CONFIG=/etc/discord-ce/config.json .venv/bin/python relay/relay.py
-```
-
-An explicitly selected file must exist. A missing default file permits
-environment-only configuration. JSON/default relative file paths resolve from
-the configuration directory; environment-supplied paths remain relative to the
-working directory. Unknown settings are rejected. Remove the obsolete
-`DISCORD_CHANNEL_ID` and `USERS_FILE` fields from older configurations.
-`users.json` is no longer read; there is no PIN login fallback.
-
-The local config, PEM files, and SQLite files under `relay/` are Git-ignored.
-Keep custom paths private too. The database contains identity links, session
-records, and — when `oidc.allow_refresh` is enabled — encrypted provider refresh
-tokens. Back it up to preserve account links, and protect it accordingly: with
-refresh enabled, the database plus `RELAY_TOKEN_KEY` together are sufficient to
-re-authenticate linked accounts until their refresh tokens expire. Run one relay
-process per deployment/database; connection ownership is in memory and is not
-coordinated across replicas.
-
-## Login and account linking
-
-1. The calculator requests login and displays the provider's URL and user code.
-2. The user approves in a browser on another device. The relay polls according
-   to the provider's interval and handles pending, slow-down, denial, and expiry.
-3. The relay validates the ID-token signature, issuer, audience, authorized party,
-   required claims, and expiry against the discovered JWKS. It never retains access
-   tokens. It requests only `openid` unless `oidc.allow_refresh` is enabled, in which
-   case it also requests `offline_access` and stores the returned refresh token
-   encrypted (see below).
-4. On first login, the calculator displays a separate link code. The user runs
-   `/relay_link code:...` in a server where the bot is installed. The code is
-   single-use and expires with the pending login.
-5. The calculator displays the Discord account from that interaction. The user
-   confirms its Discord ID with `link_confirm` before the association is saved.
-   Do not approve a different account or enter a link code supplied by someone else.
-6. The relay issues a random session token. Later logins use the saved verified
-   link. The calculator can resume with that token; resume rotates the token
-   without extending its lifetime.
-
-Each Discord account can link to one OIDC identity in this deployment. A new
-login/resume replaces the user's previous connection and resets server selection.
-`logout` revokes relay credentials; `/relay_unlink` also removes the account link,
-its stored refresh token, and closes that user's active connection. Relay logout
-does not log the user out of the identity provider. Provider-side logout/revocation
-is not pushed to the relay; a validated local session lasts until its bounded expiry
-unless locally revoked.
-
-Session records are stored in the database as SHA-256 digests of the bearer token —
-never the token itself — so sessions survive a relay restart. Presenting the token is
-the sole authentication for `resume`; the relay never trusts a client's claim about
-its own identity.
-
 ### Refresh tokens
 
 With `oidc.allow_refresh` enabled, the relay requests `offline_access` and stores the
