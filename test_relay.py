@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import hashlib
 import ipaddress
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import AsyncMock, Mock
 
 import discord
 from cryptography import x509
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
@@ -310,6 +312,50 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RelayError):
                 parse_request(raw)
         self.assertEqual(parse_request(b'{"op":"ping","id":"1"}\n')["op"], "ping")
+
+    async def test_resume_survives_restart_and_rejects_unknown_tokens(self):
+        # A fresh RelayServer shares only the database, as after a process restart.
+        restarted = RelayServer(self.config, self.provider, self.store)
+        restarted.bridge = self.bridge
+        resumed = client()
+        restarted.clients.add(resumed)
+        await restarted.dispatch(resumed, {"op": "resume", "id": "r", "token": self.token})
+        self.assertEqual(events(resumed)[0]["type"], "authenticated")
+        # A token never issued by the relay is refused regardless of any claimed identity.
+        for extra in ({}, {"discord_id": "101"}):
+            with self.assertRaises(RelayError):
+                await restarted.dispatch(client(), {"op": "resume", "id": "x",
+                                                    "token": "A" * 43, **extra})
+
+    async def test_expired_session_refreshes_silently_when_enabled(self):
+        self.config["oidc"]["allow_refresh"] = True
+        self.store.fernet = Fernet(Fernet.generate_key())
+        self.store.set_refresh_token(self.identity, "stored-refresh-token")
+        digest = hashlib.sha256(self.token.encode()).digest()
+        self.store.db.execute("UPDATE sessions SET expires_at=? WHERE token_hash=?",
+                              (time.time() - 10, digest))
+        self.store.db.commit()
+        renewed = Identity(self.identity.issuer, self.identity.subject, time.time() + 600)
+        self.provider.refresh = AsyncMock(return_value=renewed)
+        resumed = client()
+        self.relay.clients.add(resumed)
+        await self.relay.dispatch(resumed, {"op": "resume", "id": "r", "token": self.token})
+        self.provider.refresh.assert_awaited_once_with("stored-refresh-token")
+        self.assertEqual(events(resumed)[0]["type"], "authenticated")
+
+    async def test_expired_session_without_refresh_token_is_rejected(self):
+        digest = hashlib.sha256(self.token.encode()).digest()
+        self.store.db.execute("UPDATE sessions SET expires_at=? WHERE token_hash=?",
+                              (time.time() - 10, digest))
+        self.store.db.commit()
+        with self.assertRaises(RelayError):
+            await self.relay.dispatch(client(), {"op": "resume", "id": "r", "token": self.token})
+
+    def test_unlink_removes_stored_refresh_token(self):
+        self.store.fernet = Fernet(Fernet.generate_key())
+        self.store.set_refresh_token(self.identity, "stored-refresh-token")
+        self.store.remove(101)
+        self.assertIsNone(self.store.get_refresh_token(self.identity))
 
 
 if __name__ == "__main__":

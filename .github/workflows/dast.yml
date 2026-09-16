@@ -1,0 +1,52 @@
+name: DAST
+
+# Boots the relay on a real TLS port against a mock provider and Discord bridge,
+# then attacks it as an unauthenticated network client. Unlike the unit tests,
+# every probe goes over a socket, so this covers the listener and the protocol
+# surface an attacker actually reaches.
+#
+# Failures are published as code scanning alerts and rendered into the job
+# summary; the run fails if any probe fails.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  dast:
+    name: DAST (relay probes)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probes
+        id: probes
+        run: |
+          python3 build-tools/dast/relay-dast.py \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --sarif dast.sarif
+
+      - name: Upload DAST SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: dast.sarif
+          category: dast
+        if: always()

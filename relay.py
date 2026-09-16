@@ -27,6 +27,9 @@ log = logging.getLogger("relay")
 MAX_LINE = 4096
 MAX_TEXT = 512
 PAGE_SIZE = 24
+# How long an expired session row stays redeemable via its refresh token. Matches the
+# provider's refresh token lifetime; past this a session can never be revived.
+SESSION_RETENTION = 30 * 86400
 
 
 class RelayError(Exception):
@@ -59,7 +62,13 @@ def parse_request(raw):
 
 
 class LinkStore:
-    """Only verified issuer/subject -> Discord ID links are persisted."""
+    """Verified issuer/subject -> Discord ID links, refresh tokens, and session records.
+
+    Refresh tokens are Fernet-encrypted because they must be replayed to the provider
+    verbatim. Session bearer tokens are stored only as SHA-256 digests: they are never
+    replayed anywhere, only compared, so a one-way digest leaks nothing if the database
+    is disclosed.
+    """
 
     def __init__(self, path, fernet=None):
         self.fernet = fernet
@@ -74,6 +83,9 @@ class LinkStore:
         self.db.execute("CREATE TABLE IF NOT EXISTS refresh_tokens (issuer TEXT NOT NULL, "
                         "subject TEXT NOT NULL, token TEXT NOT NULL, "
                         "PRIMARY KEY (issuer, subject))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash BLOB PRIMARY KEY, "
+                        "issuer TEXT NOT NULL, subject TEXT NOT NULL, "
+                        "discord_id TEXT NOT NULL, expires_at REAL NOT NULL)")
         self.db.commit()
 
     def lookup(self, identity):
@@ -90,31 +102,21 @@ class LinkStore:
             raise RelayError("already_linked") from None
 
     def remove(self, user_id):
+        # Resolve the identity before deleting the link: the refresh token and session
+        # rows are keyed by issuer/subject, which is only reachable through that row.
         with self.db:
+            row = self.db.execute("SELECT issuer, subject FROM links WHERE discord_id=?",
+                                  (str(user_id),)).fetchone()
             self.db.execute("DELETE FROM links WHERE discord_id=?", (str(user_id),))
-            self.db.execute("DELETE FROM refresh_tokens WHERE issuer=(SELECT issuer FROM links WHERE discord_id=?) "
-                            "AND subject=(SELECT subject FROM links WHERE discord_id=?)",
-                            (str(user_id), str(user_id)))
+            self.db.execute("DELETE FROM sessions WHERE discord_id=?", (str(user_id),))
+            if row:
+                self.db.execute("DELETE FROM refresh_tokens WHERE issuer=? AND subject=?", row)
 
     def get_refresh_token(self, identity):
         if not self.fernet:
             return None
         row = self.db.execute("SELECT token FROM refresh_tokens WHERE issuer=? AND subject=?",
                               (identity.issuer, identity.subject)).fetchone()
-        if not row:
-            return None
-        try:
-            return self.fernet.decrypt(row[0].encode()).decode()
-        except InvalidToken:
-            return None
-
-    def get_refresh_token_by_discord_id(self, user_id):
-        if not self.fernet:
-            return None
-        row = self.db.execute(
-            "SELECT rt.token FROM refresh_tokens rt JOIN links l "
-            "ON rt.issuer=l.issuer AND rt.subject=l.subject WHERE l.discord_id=?",
-            (str(user_id),)).fetchone()
         if not row:
             return None
         try:
@@ -129,6 +131,49 @@ class LinkStore:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO refresh_tokens VALUES (?, ?, ?)",
                             (identity.issuer, identity.subject, encrypted))
+
+    def add_session(self, token_hash, identity, user_id, expires_at):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?)",
+                            (token_hash, identity.issuer, identity.subject,
+                             str(user_id), expires_at))
+
+    def get_session(self, token_hash):
+        """Return (Identity, discord_id, expires_at) for a presented token, or None.
+
+        Possession of the token is the authentication step; an expired row is still
+        returned so the caller can decide whether to refresh it.
+        """
+        row = self.db.execute(
+            "SELECT issuer, subject, discord_id, expires_at FROM sessions WHERE token_hash=?",
+            (token_hash,)).fetchone()
+        if not row:
+            return None
+        issuer, subject, discord_id, expires_at = row
+        return Identity(issuer, subject, expires_at), int(discord_id), expires_at
+
+    def drop_session(self, token_hash):
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
+
+    def drop_sessions_for_user(self, user_id):
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE discord_id=?", (str(user_id),))
+
+    def purge_sessions(self, cutoff):
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE expires_at <= ?", (cutoff,))
+
+    def count_live_sessions(self, now):
+        row = self.db.execute("SELECT COUNT(*) FROM sessions WHERE expires_at > ?",
+                              (now,)).fetchone()
+        return row[0]
+
+    def has_live_session(self, user_id, now):
+        row = self.db.execute(
+            "SELECT 1 FROM sessions WHERE discord_id=? AND expires_at > ? LIMIT 1",
+            (str(user_id), now)).fetchone()
+        return row is not None
 
     def close(self):
         self.db.close()
@@ -191,21 +236,26 @@ class RelayServer:
         self.config, self.provider, self.store = config, provider, store
         self.clients = set()
         self.handlers = set()
-        self.sessions = {}  # SHA-256 of random bearer tokens; never persist tokens.
+        # Cache of SHA-256 token digests -> Session. The sessions table is authoritative;
+        # this only avoids a query on the hot path and is rebuilt from it on lookup.
+        self.sessions = {}
         self.active = {}  # One connection per verified Discord account.
         self.connection_attempts = {}
         self.send_cooldowns = {}
         self.bridge = None
 
     def expire_sessions(self):
-        # Only purge sessions too old to refresh (grace period covers the provider's refresh token lifetime).
-        cutoff = time.time() - 30 * 86400
+        # Retain expired sessions long enough to still redeem a refresh token against
+        # them; beyond the provider's refresh lifetime they can never be revived.
+        cutoff = time.time() - SESSION_RETENTION
         self.sessions = {key: value for key, value in self.sessions.items()
                          if value.expires_at > cutoff}
+        self.store.purge_sessions(cutoff)
 
     def revoke(self, user_id):
         self.sessions = {key: value for key, value in self.sessions.items()
                          if value.user_id != user_id}
+        self.store.drop_sessions_for_user(user_id)
         previous = self.active.pop(user_id, None)
         if previous:
             previous.close()
@@ -316,14 +366,15 @@ class RelayServer:
             raise RelayError("session_expired")
         # Rotating credentials also invalidates every previous connection/session.
         now = time.time()
-        live_sessions = sum(1 for s in self.sessions.values() if s.expires_at > now)
-        if (live_sessions >= self.config["MAX_SESSIONS"] and
-                not any(s.user_id == user_id for s in self.sessions.values() if s.expires_at > now)):
+        if (self.store.count_live_sessions(now) >= self.config["MAX_SESSIONS"] and
+                not self.store.has_live_session(user_id, now)):
             raise RelayError("server_busy")
         self.revoke(user_id)
         token = secrets.token_urlsafe(32)
         session = Session(identity, user_id, expires)
-        self.sessions[hashlib.sha256(token.encode()).digest()] = session
+        token_hash = hashlib.sha256(token.encode()).digest()
+        self.sessions[token_hash] = session
+        self.store.add_session(token_hash, identity, user_id, expires)
         client.session = session
         client.identity = None
         client.link_code = None
@@ -361,41 +412,33 @@ class RelayServer:
             if not isinstance(token, str) or len(token) != 43:
                 raise RelayError("invalid_session")
             self.expire_sessions()
-            session = self.sessions.pop(hashlib.sha256(token.encode()).digest(), None)
-            if session and self.store.lookup(session.identity) == session.user_id:
-                if session.expires_at > time.time():
-                    # Live in-memory session — resume without extending lifetime.
-                    identity = Identity(session.identity.issuer, session.identity.subject, session.expires_at)
-                    await self.authenticate(client, identity, session.user_id, request_id)
-                    return
-                rt = self.store.get_refresh_token(session.identity)
-                if rt:
-                    try:
-                        identity = await self.provider.refresh(rt)
-                    except AuthError:
-                        raise RelayError("invalid_session")
-                    if self.store.lookup(identity) == session.user_id:
-                        await self.authenticate(client, identity, session.user_id, request_id)
-                        return
+            # Possession of the bearer token is the only authentication here. The digest
+            # lookup is authoritative and survives a restart, so nothing the client
+            # asserts about its own identity is ever trusted.
+            token_hash = hashlib.sha256(token.encode()).digest()
+            record = self.store.get_session(token_hash)
+            self.sessions.pop(token_hash, None)
+            if not record:
                 raise RelayError("invalid_session")
-            # No in-memory session (relay restart, redeploy, or long absence). Fall back to
-            # a DB-backed refresh keyed by the account's own claimed Discord ID: the token
-            # itself is not re-validated (nothing in memory to check it against), but the
-            # actual proof of identity is the provider-issued refresh token this account
-            # already has on file — an attacker without it cannot forge a session.
-            user_id = snowflake(request.get("discord_id")) if "discord_id" in request else None
-            if user_id is None:
+            identity, user_id, expires_at = record
+            self.store.drop_session(token_hash)
+            if self.store.lookup(identity) != user_id:
                 raise RelayError("invalid_session")
-            rt = self.store.get_refresh_token_by_discord_id(user_id)
+            if expires_at > time.time():
+                # Still live — resume without extending the original lifetime.
+                await self.authenticate(client, identity, user_id, request_id)
+                return
+            # Expired: silently redeem the stored refresh token for this identity.
+            rt = self.store.get_refresh_token(identity)
             if not rt:
                 raise RelayError("invalid_session")
             try:
-                identity = await self.provider.refresh(rt)
+                refreshed = await self.provider.refresh(rt)
             except AuthError:
                 raise RelayError("invalid_session")
-            if self.store.lookup(identity) != user_id:
+            if self.store.lookup(refreshed) != user_id:
                 raise RelayError("invalid_session")
-            await self.authenticate(client, identity, user_id, request_id)
+            await self.authenticate(client, refreshed, user_id, request_id)
             return
         if op == "link_confirm":
             if (not client.identity or not client.link_candidate or
@@ -410,9 +453,11 @@ class RelayServer:
         if op == "logout":
             if client.session:
                 # Send acknowledgement before the receive loop closes this socket.
+                user_id = client.session.user_id
                 self.sessions = {key: value for key, value in self.sessions.items()
-                                 if value.user_id != client.session.user_id}
-                self.active.pop(client.session.user_id, None)
+                                 if value.user_id != user_id}
+                self.store.drop_sessions_for_user(user_id)
+                self.active.pop(user_id, None)
                 client.session = None
             client.identity = client.link_code = client.link_candidate = None
             if client.login_task:
