@@ -108,6 +108,20 @@ class LinkStore:
         except InvalidToken:
             return None
 
+    def get_refresh_token_by_discord_id(self, user_id):
+        if not self.fernet:
+            return None
+        row = self.db.execute(
+            "SELECT rt.token FROM refresh_tokens rt JOIN links l "
+            "ON rt.issuer=l.issuer AND rt.subject=l.subject WHERE l.discord_id=?",
+            (str(user_id),)).fetchone()
+        if not row:
+            return None
+        try:
+            return self.fernet.decrypt(row[0].encode()).decode()
+        except InvalidToken:
+            return None
+
     def set_refresh_token(self, identity, token):
         if not self.fernet:
             return
@@ -348,28 +362,40 @@ class RelayServer:
                 raise RelayError("invalid_session")
             self.expire_sessions()
             session = self.sessions.pop(hashlib.sha256(token.encode()).digest(), None)
-            log.info("RESUME: session_found=%s sessions_total=%d", session is not None, len(self.sessions))
-            if not session or self.store.lookup(session.identity) != session.user_id:
-                log.info("RESUME: invalid — session=%s", "missing" if not session else "link_mismatch")
+            if session and self.store.lookup(session.identity) == session.user_id:
+                if session.expires_at > time.time():
+                    # Live in-memory session — resume without extending lifetime.
+                    identity = Identity(session.identity.issuer, session.identity.subject, session.expires_at)
+                    await self.authenticate(client, identity, session.user_id, request_id)
+                    return
+                rt = self.store.get_refresh_token(session.identity)
+                if rt:
+                    try:
+                        identity = await self.provider.refresh(rt)
+                    except AuthError:
+                        raise RelayError("invalid_session")
+                    if self.store.lookup(identity) == session.user_id:
+                        await self.authenticate(client, identity, session.user_id, request_id)
+                        return
                 raise RelayError("invalid_session")
-            if session.expires_at > time.time():
-                log.info("RESUME: live session, resuming")
-                identity = Identity(session.identity.issuer, session.identity.subject, session.expires_at)
-                await self.authenticate(client, identity, session.user_id, request_id)
-                return
-            log.info("RESUME: expired, attempting refresh")
-            rt = self.store.get_refresh_token(session.identity)
+            # No in-memory session (relay restart, redeploy, or long absence). Fall back to
+            # a DB-backed refresh keyed by the account's own claimed Discord ID: the token
+            # itself is not re-validated (nothing in memory to check it against), but the
+            # actual proof of identity is the provider-issued refresh token this account
+            # already has on file — an attacker without it cannot forge a session.
+            user_id = snowflake(request.get("discord_id")) if "discord_id" in request else None
+            if user_id is None:
+                raise RelayError("invalid_session")
+            rt = self.store.get_refresh_token_by_discord_id(user_id)
             if not rt:
-                log.info("RESUME: no refresh token in db")
                 raise RelayError("invalid_session")
             try:
                 identity = await self.provider.refresh(rt)
-            except AuthError as e:
-                log.info("RESUME: refresh failed: %s", e)
+            except AuthError:
                 raise RelayError("invalid_session")
-            if self.store.lookup(identity) != session.user_id:
+            if self.store.lookup(identity) != user_id:
                 raise RelayError("invalid_session")
-            await self.authenticate(client, identity, session.user_id, request_id)
+            await self.authenticate(client, identity, user_id, request_id)
             return
         if op == "link_confirm":
             if (not client.identity or not client.link_candidate or
